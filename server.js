@@ -107,47 +107,71 @@ async function checkRosa() {
         2000
       );
 
-      // Étape 3 : "Choisissez une disponibilité"
-      await page
-        .getByText(/Choisissez une disponibilit/i)
-        .first()
-        .waitFor({ state: 'visible' });
-      await page.waitForTimeout(2000); // laisse les créneaux se charger
-
-      const bodyText = await page.locator('body').innerText();
-      const idx = bodyText.search(/Choisissez une disponibilit/i);
-      const after = idx >= 0 ? bodyText.slice(idx) : bodyText;
-
-      // Première date (ex. "lundi 20 octobre 2026", "20 oct.", "20/10/2026")
-      const dateRegexes = [
-        /(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\.?\s+\d{1,2}\s+\p{L}+\.?(\s+\d{4})?/iu,
-        /\d{1,2}\s+(janv|févr|fevr|mars|avr|mai|juin|juil|août|aout|sept|oct|nov|déc|dec)\p{L}*\.?(\s+\d{4})?/iu,
-        /\d{1,2}[\/.-]\d{1,2}([\/.-]\d{2,4})?/,
-      ];
-      let firstAvailableDate = null;
-      for (const re of dateRegexes) {
-        const m = after.match(re);
-        if (m) {
-          firstAvailableDate = m[0].trim();
-          break;
-        }
-      }
-
-      // Premier bloc d'heure (ex. "09:00", "9h30", "09:00 - 09:30")
-      const timeMatch = after.match(
-        /\b\d{1,2}[:h]\d{2}(\s*[-–]\s*\d{1,2}[:h]\d{2})?/
-      );
-      const firstAvailableTime = timeMatch ? timeMatch[0].trim() : null;
-
-      if (!firstAvailableDate || !firstAvailableTime) {
+      // Étape 3 : liste des disponibilités ("Choisissez une disponibilité")
+      // Structure réelle de la page (attributs data-cy) :
+      //   [data-cy="availability-results"]
+      //     jour    : [data-cy="availability-results__day-<ts>-<n>"]  -> "Mer. 7 avr. 2027"
+      //     créneau : button[data-cy="availability-results__day-slots__slot-<ts>"]
+      //     heure   : [data-cy="availability-results__day-slots__slot__time-<ts>"] -> "09h00"
+      try {
+        await page
+          .locator('button[data-cy^="availability-results__day-slots__slot-"]')
+          .first()
+          .waitFor({ state: 'visible', timeout: 30000 });
+      } catch {
+        const bodyText = await page.locator('body').innerText();
         return {
-          error: 'date ou heure non trouvée',
-          firstAvailableDate,
-          firstAvailableTime,
-          debugText: after.slice(0, 1500),
+          error: 'aucun créneau trouvé',
+          debugText: bodyText.slice(0, 1500),
         };
       }
-      return { firstAvailableDate, firstAvailableTime };
+
+      const result = await page.evaluate(() => {
+        const root = document.querySelector('[data-cy="availability-results"]');
+        if (!root) return null;
+
+        // Premier en-tête de jour (on exclut les conteneurs "day-slots")
+        const dayEl = [...root.querySelectorAll('[data-cy^="availability-results__day-"]')].find(
+          (el) => !el.getAttribute('data-cy').startsWith('availability-results__day-slots')
+        );
+
+        const slotBtn = root.querySelector(
+          'button[data-cy^="availability-results__day-slots__slot-"]'
+        );
+        const timeEl = root.querySelector(
+          '[data-cy^="availability-results__day-slots__slot__time-"]'
+        );
+
+        let slot = null;
+        try {
+          slot = slotBtn ? JSON.parse(slotBtn.value) : null;
+        } catch {
+          slot = null;
+        }
+
+        return {
+          date: dayEl ? dayEl.textContent.trim() : null,
+          time: timeEl ? timeEl.textContent.trim() : null,
+          startUTC: slot ? slot.date : null,
+          endUTC: slot ? slot.endDate : null,
+        };
+      });
+
+      if (!result || !result.date || !result.time) {
+        const bodyText = await page.locator('body').innerText();
+        return {
+          error: 'date ou heure non trouvée',
+          result,
+          debugText: bodyText.slice(0, 1500),
+        };
+      }
+
+      return {
+        firstAvailableDate: result.date, // ex. "Mer. 7 avr. 2027"
+        firstAvailableTime: result.time, // ex. "09h00"
+        slotStartUTC: result.startUTC, // ex. "2027-04-07T07:00:00.000Z"
+        slotEndUTC: result.endUTC,
+      };
     },
     { locale: 'fr-BE' }
   );
