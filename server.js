@@ -1,22 +1,3 @@
-/**
- * Micro-service Playwright pour n8n (déployé comme app Easypanel séparée).
- *
- * n8n appelle simplement :
- *   GET http://webscrap:3000/tervuren-afspraak
- *
- * Parcours automatisé (basé sur le flux réel du formulaire) :
- *   Stap 1 : "Verblijf in België regelen"
- *   Stap 2 : "niet-Belg"
- *   Stap 3 : "Ik ben nieuw in België..."
- *   Stap 4 : "Ik kom in België werken, studeren of bij mijn familie wonen..."
- *   Stap 5 : Aantal personen = 1 (valeur par défaut, inchangée)
- *   Stap 6 : page informative, on continue simplement
- *   Stap 7 : le champ "Dag" est pré-rempli automatiquement avec la
- *            première date disponible -> c'est ce qu'on extrait.
- *   -> on s'arrête ICI, sans jamais cliquer sur "Ga verder naar stap 8"
- *      (ça finaliserait un vrai rendez-vous).
- */
-
 const express = require('express');
 const { chromium } = require('playwright');
 
@@ -24,48 +5,62 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || null;
 
-async function checkFirstAvailableDate() {
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+const ROSA_URL =
+  'https://rosa.be/fr/booking/hp/hilde-vernaeve/is-new-patient/?site=67c44339e1d1119bff139da2&skipped-steps=site';
 
+// ---------- Helpers ----------
+
+async function withPage(fn, contextOptions = {}) {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext(contextOptions);
+  const page = await context.newPage();
+  page.setDefaultTimeout(20000);
   try {
+    return await fn(page);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function clickIfVisible(locator, timeout = 2000) {
+  try {
+    await locator.first().waitFor({ state: 'visible', timeout });
+    await locator.first().click();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ---------- Tervuren (inchangé) ----------
+
+async function checkTervuren() {
+  return withPage(async (page) => {
     await page.goto('https://tervuren.mijnafspraakmaken.be/?link=a374', {
       waitUntil: 'networkidle',
     });
 
-    // Stap 1 - Type de rendez-vous
     await page.getByText('Verblijf in België regelen', { exact: true }).click();
     await page.getByRole('button', { name: 'Ga verder naar stap 2' }).click();
 
-    // Stap 2 - Nationaliteit
     await page.getByText('niet-Belg', { exact: true }).click();
     await page.getByRole('button', { name: 'Ga verder naar stap 3' }).click();
 
-    // Stap 3 - Situatie
     await page.getByText('Ik ben nieuw in België', { exact: false }).click();
     await page.getByRole('button', { name: 'Ga verder naar stap 4' }).click();
 
-    // Stap 4 - Situatie précise
     await page.getByText('Ik kom in België werken', { exact: false }).click();
     await page.getByRole('button', { name: 'Ga verder naar stap 5' }).click();
 
-    // Stap 5 - Activiteit(en) : Aantal personen reste à 1 (défaut)
     await page.getByRole('button', { name: 'Ga verder naar stap 6' }).click();
-
-    // Stap 6 - Benodigdheden (informatif) : on continue simplement
     await page.getByRole('button', { name: 'Ga verder naar stap 7' }).click();
 
-    // Stap 7 - Locatie, datum en tijd
-    // Le champ "Dag" se pré-remplit après un court chargement JS.
     await page.waitForSelector(
       'text=De eerste mogelijkheid is al voor u ingesteld',
       { timeout: 20000 }
     );
-    // Petite marge pour laisser le champ finir de se peupler
     await page.waitForTimeout(1000);
 
-    // On scanne toutes les valeurs d'input et on repère celle qui a la
-    // forme d'une date ("Ma, 5 oktober 2026") et celle d'une heure ("16:30").
     const allValues = await page.$$eval('input, select', (els) =>
       els.map((el) => el.value).filter(Boolean)
     );
@@ -77,28 +72,104 @@ async function checkFirstAvailableDate() {
     const firstAvailableTime = allValues.find((v) => timeRegex.test(v)) || null;
 
     if (!firstAvailableDate) {
-      // Rien trouvé : on renvoie toutes les valeurs de champs pour debug
       return { error: 'date non trouvée', debugValues: allValues };
     }
-
     return { firstAvailableDate, firstAvailableTime };
-  } finally {
-    await browser.close();
-  }
+  });
 }
 
-app.get('/tervuren-afspraak', async (req, res) => {
-  if (API_KEY && req.headers['x-api-key'] !== API_KEY) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  try {
-    const result = await checkFirstAvailableDate();
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// ---------- Rosa (Hilde Vernaeve) ----------
 
+async function checkRosa() {
+  return withPage(
+    async (page) => {
+      await page.goto(ROSA_URL, { waitUntil: 'domcontentloaded' });
+
+      // Bandeau cookies éventuel
+      await clickIfVisible(
+        page.getByRole('button', { name: /tout accepter|accepter|accept all|j'accepte/i }),
+        3000
+      );
+
+      // Étape 1 : "Oui, je suis un nouveau patient"
+      await page.getByText(/Oui, je suis un nouveau patient/i).first().click();
+      await clickIfVisible(
+        page.getByRole('button', { name: /suivant|continuer|next/i }),
+        2000
+      );
+
+      // Étape 2 : "Consultatie" / "Consultation"
+      const consultation = page.getByText(/consultati(e|on)/i).first();
+      await consultation.waitFor({ state: 'visible' });
+      await consultation.click();
+      await clickIfVisible(
+        page.getByRole('button', { name: /suivant|continuer|next/i }),
+        2000
+      );
+
+      // Étape 3 : "Choisissez une disponibilité"
+      await page
+        .getByText(/Choisissez une disponibilit/i)
+        .first()
+        .waitFor({ state: 'visible' });
+      await page.waitForTimeout(2000); // laisse les créneaux se charger
+
+      const bodyText = await page.locator('body').innerText();
+      const idx = bodyText.search(/Choisissez une disponibilit/i);
+      const after = idx >= 0 ? bodyText.slice(idx) : bodyText;
+
+      // Première date (ex. "lundi 20 octobre 2026", "20 oct.", "20/10/2026")
+      const dateRegexes = [
+        /(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\.?\s+\d{1,2}\s+\p{L}+\.?(\s+\d{4})?/iu,
+        /\d{1,2}\s+(janv|févr|fevr|mars|avr|mai|juin|juil|août|aout|sept|oct|nov|déc|dec)\p{L}*\.?(\s+\d{4})?/iu,
+        /\d{1,2}[\/.-]\d{1,2}([\/.-]\d{2,4})?/,
+      ];
+      let firstAvailableDate = null;
+      for (const re of dateRegexes) {
+        const m = after.match(re);
+        if (m) {
+          firstAvailableDate = m[0].trim();
+          break;
+        }
+      }
+
+      // Premier bloc d'heure (ex. "09:00", "9h30", "09:00 - 09:30")
+      const timeMatch = after.match(
+        /\b\d{1,2}[:h]\d{2}(\s*[-–]\s*\d{1,2}[:h]\d{2})?/
+      );
+      const firstAvailableTime = timeMatch ? timeMatch[0].trim() : null;
+
+      if (!firstAvailableDate || !firstAvailableTime) {
+        return {
+          error: 'date ou heure non trouvée',
+          firstAvailableDate,
+          firstAvailableTime,
+          debugText: after.slice(0, 1500),
+        };
+      }
+      return { firstAvailableDate, firstAvailableTime };
+    },
+    { locale: 'fr-BE' }
+  );
+}
+
+// ---------- Routes ----------
+
+function guard(handler) {
+  return async (req, res) => {
+    if (API_KEY && req.headers['x-api-key'] !== API_KEY) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    try {
+      res.json(await handler());
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  };
+}
+
+app.get('/tervuren-afspraak', guard(checkTervuren));
+app.get('/rosa-rdv', guard(checkRosa));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.listen(PORT, () => {
